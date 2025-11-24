@@ -220,6 +220,14 @@ parser.add_argument('--drop-path', type=float, default=None, metavar='PCT',
                     help='Drop path rate (default: None)')
 parser.add_argument('--drop-block', type=float, default=None, metavar='PCT',
                     help='Drop block rate (default: None)')
+################################################################################################ added by kz
+parser.add_argument('--dropout', type=float, default=0.0, metavar='PCT',               
+                    help='Dropout rate (direct, maps to CCT dropout, default: 0.0)')
+parser.add_argument('--attention-dropout', type=float, default=0.1, metavar='PCT',
+                    help='Attention dropout rate (default: 0.1)')
+parser.add_argument('--stochastic-depth', type=float, default=0.1, metavar='PCT',
+                    help='Stochastic depth (drop path) rate (default: 0.1)')
+################################################################################################
 
 # Batch norm parameters (only works with gen_efficientnet based models currently)
 parser.add_argument('--bn-tf', action='store_true', default=False,
