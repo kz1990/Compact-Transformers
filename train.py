@@ -366,6 +366,9 @@ def main():
         drop_connect_rate=args.drop_connect,  # DEPRECATED, use drop_path
         drop_path_rate=args.drop_path,
         drop_block_rate=args.drop_block,
+        dropout=args.dropout,                          ## added by kz
+        attention_dropout=args.attention_dropout,      ## added by kz
+        stochastic_depth=args.stochastic_depth,        ## added by kz
         global_pool=args.gp,
         bn_tf=args.bn_tf,
         bn_momentum=args.bn_momentum,
