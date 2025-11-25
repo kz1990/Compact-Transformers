@@ -291,7 +291,24 @@ parser.add_argument('--torchscript', dest='torchscript', action='store_true',
                     help='convert model torchscript for inference')
 parser.add_argument('--log-wandb', action='store_true', default=False,
                     help='log training and validation metrics to wandb')
-
+####################################################################################### LoRA added by kz
+parser.add_argument('--use-lora', action='store_true', default=False,
+                    help='Apply LoRA patch to the model')
+parser.add_argument('--lora-rank', type=int, default=8,
+                    help='LoRA rank')
+parser.add_argument('--lora-alpha', type=float, default=16.0,
+                    help='LoRA alpha')
+parser.add_argument('--lora-dropout', type=float, default=0.0,
+                    help='LoRA dropout')
+parser.add_argument('--lora-target-modules', type=str, nargs='+', default=['qkv'],
+                    help='Module name patterns to apply LoRA to')
+parser.add_argument('--lora-freeze-base', action='store_true', default=True,
+                    help='Freeze base model parameters when using LoRA')
+# Allow user to disable it with a flag
+parser.add_argument('--no-lora-freeze-base', action='store_false',
+                    dest='lora_freeze_base',
+                    help='Do NOT freeze base model parameters when using LoRA')
+#######################################################################################
 
 def _parse_args():
     # Do we have a config file to parse?
@@ -375,6 +392,22 @@ def main():
         bn_eps=args.bn_eps,
         scriptable=args.torchscript,
         checkpoint_path=args.initial_checkpoint)
+
+############################################################################### added by kz
+    if args.use_lora:
+        model = apply_lora_to_qkv_model(
+            model,
+            lora_rank=args.lora_rank,
+            lora_alpha=args.lora_alpha,
+            lora_dropout=args.lora_dropout,
+            target_modules=args.lora_target_modules,
+            freeze_base=args.lora_freeze_base
+        )
+        if args.local_rank == 0:
+            _logger.info('LoRA applied (rank %d, alpha %.1f, dropout %.2f)',
+                        args.lora_rank, args.lora_alpha, args.lora_dropout)
+###############################################################################
+
     if args.num_classes is None:
         assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'
         args.num_classes = model.num_classes  # FIXME handle model default vs config num_classes more elegantly
@@ -419,8 +452,18 @@ def main():
         assert not args.sync_bn, 'Cannot use SyncBatchNorm with torchscripted model'
         model = torch.jit.script(model)
 
-    optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args))
+################################################################################################### changed by kz
+    # optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args)) ### commented by kz
+    if args.use_lora:
+        trainable_params = model._lora_patcher.get_lora_parameters()
+        if len(trainable_params) == 0:
+            raise RuntimeError('LoRA enabled but no LoRA parameters were found.')
+    else:
+        trainable_params = model.parameters()
 
+    optimizer = create_optimizer_v2(trainable_params, **optimizer_kwargs(cfg=args))    
+###################################################################################################
+    
     # setup automatic mixed-precision (AMP) loss scaling and op casting
     amp_autocast = suppress  # do nothing
     loss_scaler = None
