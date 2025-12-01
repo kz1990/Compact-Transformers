@@ -39,6 +39,7 @@ from timm.scheduler import create_scheduler
 from timm.utils import ApexScaler, NativeScaler
 
 from src import *
+from LoRA.lora_all_modules import apply_lora_to_qkv_model        ## added by kz
 
 try:
     from apex import amp
@@ -220,6 +221,8 @@ parser.add_argument('--drop-path', type=float, default=None, metavar='PCT',
                     help='Drop path rate (default: None)')
 parser.add_argument('--drop-block', type=float, default=None, metavar='PCT',
                     help='Drop block rate (default: None)')
+
+
 ################################################################################################ added by kz
 parser.add_argument('--dropout', type=float, default=0.0, metavar='PCT',               
                     help='Dropout rate (direct, maps to CCT dropout, default: 0.0)')
@@ -228,6 +231,7 @@ parser.add_argument('--attention-dropout', type=float, default=0.1, metavar='PCT
 parser.add_argument('--stochastic-depth', type=float, default=0.1, metavar='PCT',
                     help='Stochastic depth (drop path) rate (default: 0.1)')
 ################################################################################################
+
 
 # Batch norm parameters (only works with gen_efficientnet based models currently)
 parser.add_argument('--bn-tf', action='store_true', default=False,
@@ -291,6 +295,7 @@ parser.add_argument('--torchscript', dest='torchscript', action='store_true',
                     help='convert model torchscript for inference')
 parser.add_argument('--log-wandb', action='store_true', default=False,
                     help='log training and validation metrics to wandb')
+
 ####################################################################################### LoRA added by kz
 parser.add_argument('--use-lora', action='store_true', default=False,
                     help='Apply LoRA patch to the model')
@@ -302,13 +307,39 @@ parser.add_argument('--lora-dropout', type=float, default=0.0,
                     help='LoRA dropout')
 parser.add_argument('--lora-target-modules', type=str, nargs='+', default=['qkv'],
                     help='Module name patterns to apply LoRA to')
-parser.add_argument('--lora-freeze-base', action='store_true', default=True,
+parser.add_argument('--lora-freeze-base', action='store_true', default=True,       
                     help='Freeze base model parameters when using LoRA')
 # Allow user to disable it with a flag
 parser.add_argument('--no-lora-freeze-base', action='store_false',
                     dest='lora_freeze_base',
                     help='Do NOT freeze base model parameters when using LoRA')
+
+
+# Classifier head training control (auto-determined if not specified)
+parser.add_argument('--lora-train-head', action='store_true', default=None, ## 最佳实践就是保持 lora_train_head 默认 None
+                    help='Explicitly enable classifier head training when using LoRA')
+parser.add_argument('--no-lora-train-head', dest='lora_train_head', action='store_false',
+                    help='Explicitly disable classifier head training when using LoRA')
+# REQUIRED when --use-lora: number of classes in the pretrained model
+# Used to auto-determine if head training is needed:
+#   - If pretrained_num_classes != num_classes: auto-enable head training
+#   - If pretrained_num_classes == num_classes: auto-disable head training
+parser.add_argument('--pretrained-num-classes', type=int, default=None,
+                    help='Number of classes in the pretrained model (REQUIRED when --use-lora is enabled). '
+                         'Auto-determines head training: enable if mismatch with --num-classes, disable if match.')
 #######################################################################################
+
+####################################################################################### load check points from pretrained models added by kz
+parser.add_argument('--load-checkpoint', default='', type=str, metavar='PATH',
+                    help='Load checkpoint AFTER create_model (external loading, more flexible). '
+                         'This allows loading checkpoints with different num_classes or other mismatches. '
+                         'Use --load-checkpoint-strict/--no-load-checkpoint-strict to control strict mode.')
+parser.add_argument('--load-checkpoint-strict', action='store_true', default=None,
+                    help='Load checkpoint with strict=True (default: auto-detect based on class mismatch)')
+parser.add_argument('--no-load-checkpoint-strict', dest='load_checkpoint_strict', action='store_false',
+                    help='Load checkpoint with strict=False (skip incompatible layers like classifier head)')
+#######################################################################################
+
 
 def _parse_args():
     # Do we have a config file to parse?
@@ -394,6 +425,106 @@ def main():
         checkpoint_path=args.initial_checkpoint)
 
 ############################################################################### added by kz
+    # 使用 --load-checkpoint 参数，更灵活，不需要修改 create_model 的行为
+    if args.load_checkpoint:
+        if args.local_rank == 0:
+            _logger.info(f"Loading external checkpoint from {args.load_checkpoint} (after create_model)")
+        
+        try:
+            checkpoint = torch.load(args.load_checkpoint, map_location='cpu')
+            # 处理不同的 checkpoint 格式                         自动判断 checkpoint 的结构，拿出真正的模型参数部分
+            checkpoint_state_dict = checkpoint.get('state_dict', checkpoint.get('model', checkpoint))
+            
+            # 决定是否跳过分类头
+            skip_head = False
+            if args.use_lora and args.pretrained_num_classes is not None:
+                if args.pretrained_num_classes != args.num_classes:
+                    skip_head = True
+                    if args.local_rank == 0:
+                        _logger.info(f"Will skip classifier head (class mismatch: {args.pretrained_num_classes} → {args.num_classes})")
+            
+            if skip_head:
+                # 移除分类头相关的键
+                head_keys = ['classifier.fc.weight', 'classifier.fc.bias', 'fc.weight', 'fc.bias', 
+                             'head.weight', 'head.bias', 'classifier.weight', 'classifier.bias']
+                filtered_state_dict = {k: v for k, v in checkpoint_state_dict.items() 
+                                      if not any(k.endswith(hk) for hk in head_keys)}
+            else:
+                filtered_state_dict = checkpoint_state_dict
+            
+            # 决定 strict 模式
+            use_strict = True
+            if args.load_checkpoint_strict is False:
+                use_strict = False
+            elif args.load_checkpoint_strict is None and skip_head:
+                # 如果类别数不匹配且用户未指定，默认使用 strict=False
+                use_strict = False
+            
+            # 加载权重
+            missing_keys, unexpected_keys = model.load_state_dict(filtered_state_dict, strict=use_strict)
+            if args.local_rank == 0:
+                if missing_keys:
+                    _logger.warning(f"Missing keys: {len(missing_keys)} keys")
+                    if len(missing_keys) <= 10:
+                        _logger.warning(f"Missing keys: {missing_keys}")
+                if unexpected_keys:
+                    _logger.warning(f"Unexpected keys: {len(unexpected_keys)} keys")
+                    if len(unexpected_keys) <= 10:
+                        _logger.warning(f"Unexpected keys: {unexpected_keys}")
+                if skip_head:
+                    _logger.info(f"✓ Loaded external checkpoint (skipped classifier head, strict={use_strict})")
+                else:
+                    _logger.info(f"✓ Loaded external checkpoint (strict={use_strict})")
+        except Exception as e:
+            if args.local_rank == 0:
+                _logger.error(f"Failed to load external checkpoint: {e}")
+            raise
+
+
+############################################################################### added by kz
+    # 如果使用 LoRA，必须提供预训练模型的类别数
+    if args.use_lora:
+        # 1. 检查必需参数
+        if args.pretrained_num_classes is None:
+            raise ValueError("--pretrained-num-classes is required when --use-lora is enabled. "
+                           "Please provide the number of classes in the pretrained model using --pretrained-num-classes.")
+        
+        # 2. 根据类别数一致性自动决定是否训练分类头
+        if args.pretrained_num_classes != args.num_classes:
+            # 情况 A: 类别数不匹配 → 需要训练分类头
+            if args.local_rank == 0:
+                _logger.warning(f"⚠️  Class mismatch detected: pretrained model has {args.pretrained_num_classes} classes, "
+                              f"but current model has {args.num_classes} classes.")
+            
+            # 如果用户没有明确设置，自动启用分类头训练
+            if args.lora_train_head is None:
+                args.lora_train_head = True
+                if args.local_rank == 0:
+                    _logger.info(f"✓ Auto-enabled --lora-train-head: class mismatch detected "
+                               f"({args.pretrained_num_classes} → {args.num_classes})")
+            elif args.lora_train_head and args.local_rank == 0:
+                _logger.info(f"✓ Classifier head will be trained (--lora-train-head is enabled, "
+                           f"necessary for class mismatch)")
+            elif not args.lora_train_head and args.local_rank == 0:
+                _logger.warning(f"⚠️  Warning: Class mismatch but --no-lora-train-head is set. "
+                              f"Head will be frozen, which may cause issues.")
+        else:
+            # 情况 B: 类别数一致 → 默认不训练分类头
+            if args.local_rank == 0:
+                _logger.info(f"✓ Class numbers match: pretrained={args.pretrained_num_classes}, current={args.num_classes}")
+            
+            # 如果用户没有明确设置，默认不训练分类头  但如果 lora_train_head 为 true，它仍然会被重新训练!
+            if args.lora_train_head is None:
+                args.lora_train_head = False
+                if args.local_rank == 0:
+                    _logger.info(f"✓ Auto-disabled --lora-train-head: class numbers match, head will be frozen")
+            elif args.lora_train_head and args.local_rank == 0:
+                _logger.info(f"✓ Classifier head will be trained (--lora-train-head explicitly enabled)")
+            elif not args.lora_train_head and args.local_rank == 0:
+                _logger.info(f"✓ Classifier head will be frozen (--no-lora-train-head or default)")
+###############################################################################
+
+############################################################################### added by kz
     if args.use_lora:
         model = apply_lora_to_qkv_model(
             model,
@@ -406,8 +537,35 @@ def main():
         if args.local_rank == 0:
             _logger.info('LoRA applied (rank %d, alpha %.1f, dropout %.2f)',
                         args.lora_rank, args.lora_alpha, args.lora_dropout)
-###############################################################################
+            
 
+        # 解冻分类头（如果需要训练）
+        if args.lora_train_head:
+            head_unfrozen = False
+            if hasattr(model, 'classifier') and hasattr(model.classifier, 'fc'):
+                for param in model.classifier.fc.parameters():
+                    param.requires_grad = True
+                head_unfrozen = True
+            elif hasattr(model, 'get_classifier'):
+                classifier = model.get_classifier()
+                if classifier is not None:
+                    for param in classifier.parameters():
+                        param.requires_grad = True
+                    head_unfrozen = True
+            
+            if head_unfrozen and args.local_rank == 0:
+                _logger.info("✓ Classifier head kept trainable (useful for num_classes mismatch)")
+            elif args.local_rank == 0:
+                # 如果要求训练分类头但找不到，这是错误
+                error_msg = ("Could not find classifier head to unfreeze. "
+                           "Classifier head training is required (--lora-train-head or auto-enabled due to class mismatch), "
+                           "but the model structure does not match expected patterns. "
+                           "Please check the model architecture or disable head training with --no-lora-train-head.")
+                if args.local_rank == 0:
+                    _logger.error(error_msg)
+                raise RuntimeError(error_msg)  # 所有进程都抛出异常###############################################################################
+###################################################################################
+            
     if args.num_classes is None:
         assert hasattr(model, 'num_classes'), 'Model must have `num_classes` attr if not set on cmd line/config.'
         args.num_classes = model.num_classes  # FIXME handle model default vs config num_classes more elegantly
@@ -454,16 +612,63 @@ def main():
 
 ################################################################################################### changed by kz
     # optimizer = create_optimizer_v2(model, **optimizer_kwargs(cfg=args)) ### commented by kz
+    # 如果使用 LoRA，只优化 LoRA 参数（和可选的分类头）
     if args.use_lora:
-        trainable_params = model._lora_patcher.get_lora_parameters()
-        if len(trainable_params) == 0:
-            raise RuntimeError('LoRA enabled but no LoRA parameters were found.')
+        # 获取 LoRA 参数
+        lora_params = model._lora_patcher.get_lora_parameters()
+        # 验证 LoRA 参数都是可训练的
+        lora_trainable = all(p.requires_grad for p in lora_params)
+        if not lora_trainable and args.local_rank == 0:
+            _logger.warning("⚠️  Some LoRA parameters are not trainable!")
+
+        # 如果分类头需要训练，也加入优化器
+        if args.lora_train_head:
+            head_params = []
+            if hasattr(model, 'classifier') and hasattr(model.classifier, 'fc'):
+                head_params = list(model.classifier.fc.parameters())
+            elif hasattr(model, 'get_classifier'):
+                classifier = model.get_classifier()
+                if classifier is not None:
+                    head_params = list(classifier.parameters())
+            
+            if head_params:
+                head_trainable = all(p.requires_grad for p in head_params)
+                if not head_trainable:
+                    error_msg = ("Classifier head parameters are not trainable (requires_grad=False). "
+                               "This should have been set to True earlier when lora_train_head=True. "
+                               "Please check if the head unfreezing code was executed correctly.")
+                    if args.local_rank == 0:
+                        _logger.error(error_msg)
+                    raise RuntimeError(error_msg)
+
+                lora_params.extend(head_params)
+                if args.local_rank == 0:
+                    lora_count = len(model._lora_patcher.get_lora_parameters())
+                    head_count = len(head_params)
+                    _logger.info(f"Optimizer will train: {lora_count} LoRA param groups + "
+                               f"{head_count} classifier head parameters")
+            else:
+                # 这种情况理论上不应该发生，因为前面已经检查过了
+                # 但为了安全起见，仍然检查
+                error_msg = ("Classifier head training is required but no head parameters found. "
+                           "This should have been caught earlier. Please report this issue.")
+                if args.local_rank == 0:
+                    _logger.error(error_msg)
+                raise RuntimeError(error_msg)
+
+
+        if len(lora_params) == 0:
+            raise RuntimeError("LoRA enabled but no trainable parameters found! "
+                             "Check if LoRA was applied correctly.")
+        
+        trainable_params = lora_params
     else:
+        # 正常训练：优化所有参数
         trainable_params = model.parameters()
 
     optimizer = create_optimizer_v2(trainable_params, **optimizer_kwargs(cfg=args))    
 ###################################################################################################
-    
+
     # setup automatic mixed-precision (AMP) loss scaling and op casting
     amp_autocast = suppress  # do nothing
     loss_scaler = None
