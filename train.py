@@ -431,13 +431,15 @@ def main():
             _logger.info(f"Loading external checkpoint from {args.load_checkpoint} (after create_model)")
         
         try:
-            checkpoint = torch.load(args.load_checkpoint, map_location='cpu')
+            checkpoint = torch.load(args.load_checkpoint, map_location='cpu')    ## 载入文件 不确定模型参数到底在哪儿
             # 处理不同的 checkpoint 格式                         自动判断 checkpoint 的结构，拿出真正的模型参数部分
             checkpoint_state_dict = checkpoint.get('state_dict', checkpoint.get('model', checkpoint))
             
             # 决定是否跳过分类头
+            # 如果提供了 pretrained_num_classes 且与当前 num_classes 不匹配，应该跳过分类头
+            # 这适用于 LoRA 和全量微调两种情况
             skip_head = False
-            if args.use_lora and args.pretrained_num_classes is not None:
+            if args.pretrained_num_classes is not None:
                 if args.pretrained_num_classes != args.num_classes:
                     skip_head = True
                     if args.local_rank == 0:
@@ -453,15 +455,15 @@ def main():
                 filtered_state_dict = checkpoint_state_dict
             
             # 决定 strict 模式
-            use_strict = True
-            if args.load_checkpoint_strict is False:
-                use_strict = False
+            use_strict = True                                           ## 默认认为 strict=True（最保守）
+            if args.load_checkpoint_strict is False: 
+                use_strict = False                                      ## 用户明确说：我要 strict=False
             elif args.load_checkpoint_strict is None and skip_head:
                 # 如果类别数不匹配且用户未指定，默认使用 strict=False
-                use_strict = False
-            
-            # 加载权重
+                use_strict = False                                      ## 用户没说 + 我们检测到要跳过 head（类别数不匹配）
+            # 加载权重   key 存在于模型的参数中，但在 state_dict 里找不到对应的条目 is missing_keys, key 存在于 state_dict 里，但在模型中没有对应的参数 is unexpected_keys
             missing_keys, unexpected_keys = model.load_state_dict(filtered_state_dict, strict=use_strict)
+
             if args.local_rank == 0:
                 if missing_keys:
                     _logger.warning(f"Missing keys: {len(missing_keys)} keys")
@@ -482,7 +484,7 @@ def main():
 
 
 ############################################################################### added by kz
-    # 如果使用 LoRA，必须提供预训练模型的类别数
+    # 如果使用 LoRA，必须提供预训练模型的类别数  this is to determine args.lora_train_head
     if args.use_lora:
         # 1. 检查必需参数
         if args.pretrained_num_classes is None:
@@ -530,6 +532,7 @@ def main():
             model,
             lora_rank=args.lora_rank,
             lora_alpha=args.lora_alpha,
+
             lora_dropout=args.lora_dropout,
             target_modules=args.lora_target_modules,
             freeze_base=args.lora_freeze_base
